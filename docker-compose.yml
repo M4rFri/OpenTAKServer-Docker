@@ -1,16 +1,67 @@
+# OpenTAKServer – Adapted for Portainer CE
+#
+# Key difference from the upstream version: NO bind mounts are used.
+# Portainer CE does not resolve relative paths from a Git repository to the Docker host,
+# while absolute paths would require manual preparation of the host system.
+# Instead, this setup uses the following approach:
+# - All persistent data is stored in Docker named volumes.
+# - All configuration files are copied directly into the images using lightweight Dockerfiles.
+# - Build contexts are uploaded to the Docker daemon, ensuring compatibility even when the host cannot directly access the repository directory.
+# For available configuration variables, see .env.example.
+
+x-ots-env: &ots-env
+  SQLALCHEMY_DATABASE_URI: "postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@ots-db/${POSTGRES_DB}"
+  OTS_FQDN: "${OTS_FQDN}"
+  OTS_RABBITMQ_SERVER_ADDRESS: "rabbitmq"
+  OTS_LISTENER_ADDRESS: "0.0.0.0"
+  OTS_MEDIAMTX_API_ADDRESS: "http://mediamtx:9997"
+
 services:
+  # ---------------------------------------------------------------
+  # One-time initialization: Generates a DEDICATED Certificate Authority (CA) inside the volume.
+  # ---------------------------------------------------------------
+  ots-init:
+    image: ghcr.io/brian7704/opentakserver:${OTS_TAG}
+    container_name: ots-init
+    environment: *ots-env
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        mkdir -p /app/ots/uploads /app/ots/logs /app/ots/mediamtx/recordings
+        if [ ! -f /app/ots/ca/.ots-ca-generated ]; then
+          echo "Generating a dedicated CA for OpenTAKServer..."
+          rm -rf /app/ots/ca
+          mkdir -p /app/ots/ca
+          APP=$$(ls /app/venv/lib/python3*/site-packages/opentakserver/app.py | head -1)
+          /app/venv/bin/flask --app "$$APP" ots create-ca
+          touch /app/ots/ca/.ots-ca-generated
+          echo "CA generated."
+        else
+          echo "CA already exists, nothing to do."
+        fi
+    volumes:
+      - "ots-data:/app/ots"
+    depends_on:
+      ots-db:
+        condition: service_healthy
+    restart: "no"
+    networks: [ots]
+
   ots:
-    image: ghcr.io/brian7704/opentakserver:master
+    image: ghcr.io/brian7704/opentakserver:${OTS_TAG}
     container_name: opentakserver
     hostname: opentakserver
     restart: unless-stopped
     tty: true
+    environment: *ots-env
     ports:
-      - "8081:8081" # OTS listens on this port on the loopback interface for HTTP(S) requests
+      - "127.0.0.1:8081:8081"
     volumes:
-      - "./ots:/app/ots:rw"
-      #- "./.opentakserver_venv:/app/venv/:rw"
+      - "ots-data:/app/ots"
     depends_on:
+      ots-init:
+        condition: service_completed_successfully
       rabbitmq:
         condition: service_healthy
       mediamtx:
@@ -20,140 +71,169 @@ services:
       interval: 60s
       timeout: 5s
       retries: 3
-      start_period: 60s
-    env_file: ots_config.env
+      start_period: 120s
+    networks: [ots]
 
   ots_cot_parser:
-    image: ghcr.io/brian7704/ots_cot_parser:master
+    image: ghcr.io/brian7704/ots_cot_parser:${OTS_TAG}
     container_name: ots_cot_parser
-    hostname: ots-cot_parser
+    hostname: ots_cot_parser
     restart: unless-stopped
     tty: true
     command: python3 /app/venv/bin/cot_parser
+    environment: *ots-env
     healthcheck:
       disable: true
     volumes:
-      - "./ots:/app/ots:rw"
+      - "ots-data:/app/ots"
     depends_on:
       ots:
         condition: service_healthy
-    env_file: ots_config.env
+    networks: [ots]
 
   ots_eud_handler:
-    image: ghcr.io/brian7704/ots_eud_handler:master
+    image: ghcr.io/brian7704/ots_eud_handler:${OTS_TAG}
     container_name: ots_eud_handler
     hostname: ots_eud_handler
     restart: unless-stopped
     tty: true
     command: python3 /app/venv/bin/eud_handler
+    environment: *ots-env
     ports:
-      - "0.0.0.0:8088:8088" # TCP CoT streaming port
+      - "0.0.0.0:8088:8088"
     healthcheck:
       disable: true
     volumes:
-      - "./ots:/app/ots:rw"
-    env_file: ots_config.env
+      - "ots-data:/app/ots"
+    depends_on:
+      ots:
+        condition: service_healthy
+    networks: [ots]
 
   ots_eud_handler_ssl:
-    image: ghcr.io/brian7704/ots_eud_handler_ssl:master
+    image: ghcr.io/brian7704/ots_eud_handler_ssl:${OTS_TAG}
     container_name: ots_eud_handler_ssl
     hostname: ots_eud_handler_ssl
     restart: unless-stopped
     tty: true
     command: python3 /app/venv/bin/eud_handler --ssl
+    environment: *ots-env
     ports:
-      - "0.0.0.0:8089:8089" # SSL CoT streaming port
+      - "0.0.0.0:8089:8089"
     healthcheck:
       disable: true
     volumes:
-      - "./ots:/app/ots"
-    env_file: ots_config.env
+      - "ots-data:/app/ots"
     depends_on:
       ots:
         condition: service_healthy
+    networks: [ots]
 
   ots-webui:
-    image: ghcr.io/brian7704/opentakserver-ui:master
-    container_name: ots-webui
+    image: ghcr.io/brian7704/opentakserver-ui:${OTS_TAG}
+    container_name: opentakserver-webui
     hostname: opentakserver-webui
+    restart: unless-stopped
+    healthcheck:
+      disable: true
+    networks: [ots]
 
   nginx-proxy:
     build:
       context: .
-      dockerfile: ots/configs/nginx/Dockerfile
-    container_name: nginx-proxy
+      dockerfile: ots/configs/nginx/Dockerfile.proxy
+    image: ots-nginx-proxy:local
+    pull_policy: build
+    container_name: ots-nginx-proxy
     hostname: nginx-proxy
     restart: unless-stopped
+    environment:
+      OTS_FQDN: "${OTS_FQDN}"
+      OTS_WEBUI_ADDRESS: "opentakserver-webui"
+      OTS_ADDRESS: "opentakserver:8081"
+      MTX_ADDRESS: "mediamtx"
+      CLIENT_MAX_BODY_SIZE: "512M"
     ports:
-      - "0.0.0.0:80:80" # HTTP Web UI
-      - "0.0.0.0:443:443" # HTTPS Web UI
-      - "0.0.0.0:8080:8080" # HTTP API requests to OpenTAKServer port 8081
-      - "0.0.0.0:8443:8443" # HTTPS API requests to OpenTAKServer port 8081
-      - "0.0.0.0:8446:8446" # Proxy for certificate enrollment to OpenTAKServer port 8081
-      - "0.0.0.0:8883:8883" # Proxy for MQTT / Meshtastic to Rabbitmq port 1883
+      - "0.0.0.0:80:80"       # WebUI HTTP -> Redirects to HTTPS
+      - "0.0.0.0:443:443"     # WebUI HTTPS
+      - "0.0.0.0:8080:8080"   # Marti API HTTP
+      - "0.0.0.0:8443:8443"   # Marti API HTTPS, client certificate required
+      - "0.0.0.0:8446:8446"   # Certificate enrollment
     volumes:
-      - "./ots/ca:/app/ots/ca:ro"
-      - "./ots/configs/nginx/conf.d:/etc/nginx/conf.d:ro"
-      - ./ots/configs/nginx/letsencrypt/www:/var/www/certbot/:rw
-      - ./ots/configs/nginx/letsencrypt/certs/:/etc/letsencrypt/:rw
+      - "ots-data:/app/ots:ro"   # Nginx loads the CA certificates from /app/ots/ca.
     depends_on:
       ots:
         condition: service_healthy
-
-  certbot:
-    image: certbot/certbot:latest
-    volumes:
-      - ./ots/configs/nginx/letsencrypt/www:/var/www/certbot/:rw
-      - ./ots/configs/nginx/letsencrypt/certs/:/etc/letsencrypt/:rw
-
+    networks: [ots]
   rabbitmq:
-    image: rabbitmq:latest
-    container_name: rabbitmq
+    build:
+      context: .
+      dockerfile: ots/configs/rabbitmq/Dockerfile
+    image: ots-rabbitmq:local
+    pull_policy: build
+    container_name: ots-rabbitmq
     hostname: rabbitmq
     restart: unless-stopped
     volumes:
-      - "./ots/configs/rabbitmq/enabled_plugins:/etc/rabbitmq/enabled_plugins:ro"
-      - "./ots/configs/rabbitmq/99-opentakserver.conf:/etc/rabbitmq/conf.d/99-opentakserver.conf:ro"
+      - "rabbitmq-data:/var/lib/rabbitmq"
+    ports:
+      - "127.0.0.1:1883:1883"   # MQTT (Meshtastic)
     healthcheck:
       test: rabbitmq-diagnostics -q ping
       interval: 30s
       timeout: 30s
       retries: 3
+    networks: [ots]
 
   mediamtx:
-    image: bluenviron/mediamtx:1.13.0-ffmpeg
-    container_name: mediamtx
+    build:
+      context: .
+      dockerfile: ots/mediamtx/Dockerfile
+    image: ots-mediamtx:local
+    pull_policy: build
+    container_name: ots-mediamtx
     hostname: mediamtx
     restart: unless-stopped
-#    network_mode: host
     ports:
-      - "0.0.0.0:1935:1935" # RTMP video streams
-      - "0.0.0.0:1936:1936" # RTMPS video streams
-      - "0.0.0.0:8000:8000/udp" # RTP video streams
-      - "0.0.0.0:8001:8001/udp" # RTCP video streams
-      - "0.0.0.0:8189:8189/udp" # WebRTC
-      - "0.0.0.0:8322:8322" # RTSP(S) video streams
-      - "0.0.0.0:8554:8554" # RTSP video streams
-      - "0.0.0.0:8888:8888" # HLS video streams
-      - "0.0.0.0:8889:8889" # WebRTC streams
-      - "0.0.0.0:8890:8890/udp" # SRT streams
-      - "0.0.0.0:9997:9997" # MediaMTX API
+      - "0.0.0.0:1935:1935"       # RTMP
+      - "0.0.0.0:1936:1936"       # RTMPS
+      - "0.0.0.0:8000:8000/udp"   # RTP
+      - "0.0.0.0:8001:8001/udp"   # RTCP
+      - "0.0.0.0:8189:8189/udp"   # WebRTC ICE
+      - "0.0.0.0:8322:8322"       # RTSPS
+      - "0.0.0.0:8554:8554"       # RTSP
+      - "0.0.0.0:8888:8888"       # HLS
+      - "0.0.0.0:8889:8889"       # WebRTC
+      - "0.0.0.0:8890:8890/udp"   # SRT
+      - "127.0.0.1:9997:9997"     # MediaMTX API
     volumes:
-      - "./ots:/app/ots"
-      - "./ots/mediamtx/mediamtx.yml:/mediamtx.yml"
+      - "ots-data:/app/ots"       # Recordings are stored in /app/ots/mediamtx/recordings.
+    networks: [ots]
 
   ots-db:
     image: postgis/postgis:18-3.6
     container_name: ots-db
     hostname: ots-db
     restart: unless-stopped
-    env_file: ots_config.env
+    environment:
+      POSTGRES_USER: "${POSTGRES_USER}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD}"
+      POSTGRES_DB: "${POSTGRES_DB}"
+      PGUSER: "${POSTGRES_USER}"
     volumes:
-      - "./ots/pgdata:/var/lib/postgresql"
+      - "pgdata:/var/lib/postgresql"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready"]
-      interval: 1s
+      interval: 5s
       timeout: 5s
-      retries: 10
-    ports:
-      - "5432:5432"
+      retries: 20
+    networks: [ots]
+
+networks:
+  ots:
+    name: ots
+
+volumes:
+  ots-data:
+  pgdata:
+  rabbitmq-data:
