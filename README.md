@@ -6,3 +6,5 @@ depending on your platform.
 
 This repo is new and not quite complete. Full documentation will be available on https://docs.opentakserver.io when it's ready
 for use. CloudTAK will also be incorporated into docker-compose.yml.
+
+This fork has been adapted for **Portainer CE** removing Bind-Mounts and moving Confings in the Images.

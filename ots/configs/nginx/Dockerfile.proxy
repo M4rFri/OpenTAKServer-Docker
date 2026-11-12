@@ -1,0 +1,15 @@
+# Reverse Proxy for OpenTAKServer.
+#
+FROM ghcr.io/brian7704/opentakserver-ui:master
+
+COPY ./ots/configs/nginx/templates/ /etc/nginx/templates/
+
+# mqtts-8883.conf goes into the stream{} context, which by default is not included.
+# This would cause nginx to fail to start if it were placed in conf.d, so we remove it.
+RUN rm -f /etc/nginx/templates/mqtts-8883.conf.stream-template
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends curl \
+ && rm -rf /var/lib/apt/lists/*
+
+EXPOSE 80 443 8080 8443 8446
