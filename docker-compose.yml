@@ -118,8 +118,9 @@ services:
     tty: true
     command: python3 /app/venv/bin/eud_handler --ssl
     environment: *ots-env
-    ports:
-      - "0.0.0.0:8089:8089"
+    # Routed by the external Traefik, no host port is published.
+    expose:
+      - "8089"
     healthcheck:
       disable: true
     volumes:
@@ -127,7 +128,16 @@ services:
     depends_on:
       ots:
         condition: service_healthy
-    networks: [ots]
+    networks: [ots, traefik]
+    labels:
+      traefik.enable: "true"
+      traefik.docker.network: "${TRAEFIK_NETWORK:-traefik}"
+
+      traefik.tcp.routers.ots-cot-ssl.rule: "HostSNI(`${OTS_FQDN}`)"
+      traefik.tcp.routers.ots-cot-ssl.entrypoints: "${TRAEFIK_COT_TLS_ENTRYPOINT:-takstreamingsecure}"
+      traefik.tcp.routers.ots-cot-ssl.tls.passthrough: "true"
+      traefik.tcp.routers.ots-cot-ssl.service: "ots-cot-ssl"
+      traefik.tcp.services.ots-cot-ssl.loadbalancer.server.port: "8089"
 
   ots-webui:
     image: ghcr.io/brian7704/opentakserver-ui:${OTS_TAG}
