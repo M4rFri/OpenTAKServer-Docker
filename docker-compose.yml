@@ -153,18 +153,80 @@ services:
       OTS_ADDRESS: "opentakserver:8081"
       MTX_ADDRESS: "mediamtx"
       CLIENT_MAX_BODY_SIZE: "512M"
-    ports:
-      - "0.0.0.0:80:80"       # WebUI HTTP -> Redirects to HTTPS
-      - "0.0.0.0:443:443"     # WebUI HTTPS
-      - "0.0.0.0:8080:8080"   # Marti API HTTP
-      - "0.0.0.0:8443:8443"   # Marti API HTTPS, client certificate required
-      - "0.0.0.0:8446:8446"   # Certificate enrollment
+    expose:
+      - "80"
+      - "8080"
+      - "8443"
+      - "8446"
     volumes:
       - "ots-data:/app/ots:ro"   # Nginx loads the CA certificates from /app/ots/ca.
     depends_on:
       ots:
         condition: service_healthy
-    networks: [ots]
+    networks: [ots, traefik]
+    labels:
+      traefik.enable: "true"
+      traefik.docker.network: "${TRAEFIK_NETWORK:-traefik}"
+
+      # ---------------------------------------------------------------
+      # WebUI / API - HTTP (entrypoint :80), redirects to HTTPS
+      # ---------------------------------------------------------------
+      traefik.http.routers.ots-web.rule: "Host(`${OTS_FQDN}`)"
+      traefik.http.routers.ots-web.entrypoints: "${TRAEFIK_WEB_ENTRYPOINT:-web}"
+      traefik.http.routers.ots-web.service: "ots-webui"
+      traefik.http.routers.ots-web.middlewares: "ots-https-redirect"
+      traefik.http.middlewares.ots-https-redirect.redirectscheme.scheme: "https"
+      traefik.http.middlewares.ots-https-redirect.redirectscheme.permanent: "true"
+
+      # ---------------------------------------------------------------
+      # WebUI / API - HTTPS (entrypoint :443), TLS terminated by Traefik
+      # ---------------------------------------------------------------
+      traefik.http.routers.ots-websecure.rule: "Host(`${OTS_FQDN}`)"
+      traefik.http.routers.ots-websecure.entrypoints: "${TRAEFIK_WEBSECURE_ENTRYPOINT:-websecure}"
+      traefik.http.routers.ots-websecure.service: "ots-webui"
+      traefik.http.routers.ots-websecure.tls: "true"
+      traefik.http.routers.ots-websecure.tls.certresolver: "${TRAEFIK_CERTRESOLVER:-letsencrypt}"
+      traefik.http.services.ots-webui.loadbalancer.server.port: "80"
+
+      # ---------------------------------------------------------------
+      # Marti API - HTTP (dedicated Traefik entrypoint on :8080)
+      # ---------------------------------------------------------------
+      traefik.http.routers.ots-marti.rule: "Host(`${OTS_FQDN}`)"
+      traefik.http.routers.ots-marti.entrypoints: "${TRAEFIK_MARTI_ENTRYPOINT:-takapi}"
+      traefik.http.routers.ots-marti.service: "ots-marti"
+      traefik.http.services.ots-marti.loadbalancer.server.port: "8080"
+
+      # ---------------------------------------------------------------
+      # Marti API - mTLS (dedicated Traefik entrypoint on :8443)
+      #
+      # This service requires a client certificate issued by the OTS CA.
+      # Therefore TLS is NOT terminated by Traefik: a TCP router with
+      # passthrough forwards the raw TLS stream to nginx, which keeps doing
+      # the server certificate and the "ssl_verify_client on" check exactly
+      # as before. Traefik only picks the route based on the SNI.
+      #
+      # NOTE: SNI routing requires clients to connect via the hostname.
+      # If OTS_FQDN is an IP address (or clients send no SNI), change the
+      # rule below to HostSNI(`*`) - that is safe here because :8443 is a
+      # dedicated entrypoint used by OpenTAKServer only.
+      # ---------------------------------------------------------------
+      traefik.tcp.routers.ots-marti-mtls.rule: "HostSNI(`${OTS_FQDN}`)"
+      traefik.tcp.routers.ots-marti-mtls.entrypoints: "${TRAEFIK_MARTI_TLS_ENTRYPOINT:-takapisecure}"
+      traefik.tcp.routers.ots-marti-mtls.tls.passthrough: "true"
+      traefik.tcp.routers.ots-marti-mtls.service: "ots-marti-mtls"
+      traefik.tcp.services.ots-marti-mtls.loadbalancer.server.port: "8443"
+
+      # ---------------------------------------------------------------
+      # Certificate enrollment (dedicated Traefik entrypoint on :8446)
+      #
+      # Also passthrough: TAK clients enroll against the OTS CA certificate,
+      # so nginx has to present its own certificate here, not a Let's Encrypt one.
+      # ---------------------------------------------------------------
+      traefik.tcp.routers.ots-enrollment.rule: "HostSNI(`${OTS_FQDN}`)"
+      traefik.tcp.routers.ots-enrollment.entrypoints: "${TRAEFIK_ENROLLMENT_ENTRYPOINT:-takace}"
+      traefik.tcp.routers.ots-enrollment.tls.passthrough: "true"
+      traefik.tcp.routers.ots-enrollment.service: "ots-enrollment"
+      traefik.tcp.services.ots-enrollment.loadbalancer.server.port: "8446"
   rabbitmq:
     build:
       context: .
@@ -232,6 +294,10 @@ services:
 networks:
   ots:
     name: ots
+
+  traefik:
+    external: true
+    name: "${TRAEFIK_NETWORK:-traefik}"
 
 volumes:
   ots-data:
