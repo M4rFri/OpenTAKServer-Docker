@@ -140,7 +140,7 @@ services:
       traefik.tcp.services.ots-cot-ssl.loadbalancer.server.port: "8089"
 
   ots-webui:
-    image: ghcr.io/brian7704/opentakserver-ui:${OTS_TAG}
+    image: ghcr.io/brian7704/opentakserver-ui:master
     container_name: opentakserver-webui
     hostname: opentakserver-webui
     restart: unless-stopped
